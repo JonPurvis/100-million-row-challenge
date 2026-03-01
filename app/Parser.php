@@ -37,7 +37,7 @@ use const WNOHANG;
 final class Parser
 {
     private const WORKERS = 10;
-    private const READ_CHUNK = 16777216;
+    private const READ_CHUNK = 33554432;
 
     public function parse(string $inputPath, string $outputPath): void
     {
@@ -110,49 +110,69 @@ final class Parser
         fclose($fh);
         $b[] = $fileSize;
 
-        $tmp = sys_get_temp_dir();
         $me = getmypid();
         $ch = [];
-        
-        $useIgbinary = function_exists('igbinary_serialize');
+        $totalSize = $pathCount * $dateCount;
+        $segSize = $totalSize * 2;
 
+        $useShmop = false;
+        $shm = [];
+        if (function_exists('shmop_open')) {
+            set_error_handler(static fn() => true);
+            try {
+                $test = \shmop_open(($me << 4) + 1, 'c', 0644, $segSize);
+                if ($test instanceof \Shmop) {
+                    $useShmop = true;
+                    $shm[0] = $test;
+                    for ($i = 1; $i < $w - 1; $i++) {
+                        $shm[$i] = \shmop_open(($me << 4) + $i + 1, 'c', 0644, $segSize);
+                    }
+                }
+            } catch (\Throwable) {
+                $useShmop = false;
+                $shm = [];
+            } finally {
+                restore_error_handler();
+            }
+        }
+
+        $tmp = $useShmop ? '' : sys_get_temp_dir();
         for ($i = 0; $i < $w - 1; $i++) {
-            $tf = "$tmp/p{$me}w$i";
             $pid = pcntl_fork();
             if ($pid === 0) {
                 $cnt = self::worker($inputPath, $b[$i], $b[$i + 1], $pathIds, $dateIdChars, $pathCount, $dateCount);
-                if ($useIgbinary) {
-                    file_put_contents($tf, igbinary_serialize($cnt));
+                $packed = pack('v*', ...$cnt);
+                if ($useShmop) {
+                    \shmop_write($shm[$i], $packed, 0);
                 } else {
-                    file_put_contents($tf, pack('v*', ...$cnt));
+                    file_put_contents("$tmp/p{$me}w$i", $packed);
                 }
                 exit(0);
             }
-            $ch[$pid] = $tf;
+            $ch[$pid] = $i;
         }
 
         $cnt = self::worker($inputPath, $b[$w - 1], $b[$w], $pathIds, $dateIdChars, $pathCount, $dateCount);
 
         $pending = count($ch);
-        $totalSize = $pathCount * $dateCount;
         while ($pending > 0) {
             $pid = pcntl_wait($status, WNOHANG);
             if ($pid <= 0) {
                 $pid = pcntl_wait($status);
             }
-            $data = file_get_contents($ch[$pid]);
-            unlink($ch[$pid]);
-            
-            if ($useIgbinary) {
-                $wc = igbinary_unserialize($data);
-                for ($j = 0; $j < $totalSize; $j++) {
-                    $cnt[$j] += $wc[$j];
-                }
+            $idx = $ch[$pid];
+
+            if ($useShmop) {
+                $wc = unpack('v*', \shmop_read($shm[$idx], 0, $segSize));
+                \shmop_delete($shm[$idx]);
             } else {
-                $wc = unpack('v*', $data);
-                $j = 0;
-                foreach ($wc as $v) $cnt[$j++] += $v;
+                $tf = "$tmp/p{$me}w$idx";
+                $wc = unpack('v*', file_get_contents($tf));
+                unlink($tf);
             }
+
+            $j = 0;
+            foreach ($wc as $v) $cnt[$j++] += $v;
             $pending--;
         }
 
