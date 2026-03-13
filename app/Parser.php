@@ -22,6 +22,7 @@ use function unpack;
 use function pack;
 use function file_put_contents;
 use function file_get_contents;
+use function file_exists;
 use function str_replace;
 use function implode;
 use function pcntl_fork;
@@ -40,9 +41,9 @@ use const SEEK_CUR;
 
 final class Parser
 {
-    private const WORKERS = 8;
-    private const CHUNKS = 32;
-    private const READ_CHUNK = 4_194_304;
+    private const WORKERS = 10;
+    private const CHUNKS = 120;
+    private const READ_CHUNK = 524_288;
 
     public function parse(string $inputPath, string $outputPath): void
     {
@@ -124,35 +125,13 @@ final class Parser
         $w = self::WORKERS;
         $ch = [];
         $totalSize = $pathCount * $dateCount;
-        $segSize = $totalSize * 2;
-
-        $useShmop = false;
-        $shm = [];
-        if (function_exists('shmop_open')) {
-            set_error_handler(static fn() => true);
-            try {
-                $test = \shmop_open(($me << 4) + 1, 'c', 0644, $segSize);
-                if ($test instanceof \Shmop) {
-                    $useShmop = true;
-                    $shm[0] = $test;
-                    for ($i = 1; $i < $w; $i++) {
-                        $shm[$i] = \shmop_open(($me << 4) + $i + 1, 'c', 0644, $segSize);
-                    }
-                }
-            } catch (\Throwable) {
-                $useShmop = false;
-                $shm = [];
-            } finally {
-                restore_error_handler();
-            }
-        }
 
         $useSem = false;
         $sem = null;
         $queueShm = null;
         $queueFile = '';
 
-        if (function_exists('sem_get') && $useShmop) {
+        if (function_exists('sem_get') && function_exists('shmop_open')) {
             set_error_handler(static fn() => true);
             try {
                 $sem = \sem_get($me + 1, 1, 0644, true);
@@ -176,15 +155,11 @@ final class Parser
         for ($i = 0; $i < $w; $i++) {
             $pid = pcntl_fork();
             if ($pid === 0) {
-                $cnt = $useSem
+                $payload = $useSem
                     ? self::workerLoopSem($inputPath, $queueShm, $sem, $offsets, $numChunks, $pathIds, $dateIdChars, $pathCount, $dateCount)
                     : self::workerLoopFlock($inputPath, $queueFile, $offsets, $numChunks, $pathIds, $dateIdChars, $pathCount, $dateCount);
-                $packed = pack('v*', ...$cnt);
-                if ($useShmop) {
-                    \shmop_write($shm[$i], $packed, 0);
-                } else {
-                    file_put_contents("$tmp/p{$me}w$i", $packed);
-                }
+                
+                file_put_contents("$tmp/p{$me}w$i", $payload);
                 exit(0);
             }
             $ch[$pid] = $i;
@@ -194,19 +169,26 @@ final class Parser
         $pending = $w;
         while ($pending > 0) {
             $pid = pcntl_wait($status);
-            $idx = $ch[$pid];
-
-            if ($useShmop) {
-                $wc = unpack('v*', \shmop_read($shm[$idx], 0, $segSize));
-                \shmop_delete($shm[$idx]);
-            } else {
-                $tf = "$tmp/p{$me}w$idx";
-                $wc = unpack('v*', file_get_contents($tf));
-                unlink($tf);
+            
+            if ($pid <= 0 || !isset($ch[$pid])) {
+                $pending--;
+                continue;
             }
 
-            for ($j = 0, $k = 1; $j < $totalSize; $j++, $k++) {
-                $cnt[$j] += $wc[$k];
+            $idx = $ch[$pid];
+            $file = "$tmp/p{$me}w$idx";
+            
+            if (file_exists($file)) {
+                $content = file_get_contents($file);
+                unlink($file);
+                
+                if ($content !== '') {
+                    $wc = unpack('V*', $content);
+                    $len = count($wc);
+                    for ($j = 1; $j <= $len; $j += 2) {
+                        $cnt[$wc[$j]] += $wc[$j + 1];
+                    }
+                }
             }
             $pending--;
         }
@@ -215,7 +197,7 @@ final class Parser
             \shmop_delete($queueShm);
             \sem_remove($sem);
         } else {
-            unlink($queueFile);
+            if (file_exists($queueFile)) unlink($queueFile);
         }
 
         self::writeJson($outputPath, $cnt, $paths, $dates, $dateCount);
@@ -250,7 +232,7 @@ final class Parser
         return $ci;
     }
 
-    private static function workerLoopSem(string $f, mixed $queueShm, mixed $sem, array $offsets, int $numChunks, array $pi, array $dc, int $pc, int $dateCount): array
+    private static function workerLoopSem(string $f, mixed $queueShm, mixed $sem, array $offsets, int $numChunks, array $pi, array $dc, int $pc, int $dateCount): string
     {
         $bk = array_fill(0, $pc, '');
         $h = fopen($f, 'rb');
@@ -261,17 +243,10 @@ final class Parser
         }
 
         fclose($h);
-
-        $cnt = array_fill(0, $pc * $dateCount, 0);
-        for ($i = 0; $i < $pc; $i++) {
-            if ($bk[$i] === '') continue;
-            $off = $i * $dateCount;
-            foreach (array_count_values(unpack('v*', $bk[$i])) as $did => $c) $cnt[$off + $did] += $c;
-        }
-        return $cnt;
+        return self::packSparsePayload($bk, $pc, $dateCount);
     }
 
-    private static function workerLoopFlock(string $f, string $queueFile, array $offsets, int $numChunks, array $pi, array $dc, int $pc, int $dateCount): array
+    private static function workerLoopFlock(string $f, string $queueFile, array $offsets, int $numChunks, array $pi, array $dc, int $pc, int $dateCount): string
     {
         $bk = array_fill(0, $pc, '');
         $h = fopen($f, 'rb');
@@ -284,14 +259,21 @@ final class Parser
 
         fclose($qf);
         fclose($h);
+        return self::packSparsePayload($bk, $pc, $dateCount);
+    }
 
-        $cnt = array_fill(0, $pc * $dateCount, 0);
+    private static function packSparsePayload(array $bk, int $pc, int $dateCount): string
+    {
+        $sparseData = [];
         for ($i = 0; $i < $pc; $i++) {
             if ($bk[$i] === '') continue;
             $off = $i * $dateCount;
-            foreach (array_count_values(unpack('v*', $bk[$i])) as $did => $c) $cnt[$off + $did] += $c;
+            foreach (array_count_values(unpack('v*', $bk[$i])) as $did => $c) {
+                $sparseData[] = $off + $did;
+                $sparseData[] = $c;
+            }
         }
-        return $cnt;
+        return $sparseData ? pack('V*', ...$sparseData) : '';
     }
 
     private static function parseRange(mixed $h, int $s, int $e, array $pi, array $dc, array &$bk): void
@@ -326,10 +308,12 @@ final class Parser
                 $x = strpos($d, ',', $p); $bk[$pi[substr($d, $p, $x - $p)]] .= $dc[substr($d, $x + 3, 8)]; $p = $x + 52;
                 $x = strpos($d, ',', $p); $bk[$pi[substr($d, $p, $x - $p)]] .= $dc[substr($d, $x + 3, 8)]; $p = $x + 52;
                 $x = strpos($d, ',', $p); $bk[$pi[substr($d, $p, $x - $p)]] .= $dc[substr($d, $x + 3, 8)]; $p = $x + 52;
+                if ($p > $ln) break;
             }
 
             while ($p < $ln) {
                 $x = strpos($d, ',', $p);
+                if ($x === false) break;
                 $bk[$pi[substr($d, $p, $x - $p)]] .= $dc[substr($d, $x + 3, 8)];
                 $p = $x + 52;
             }
